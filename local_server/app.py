@@ -1,10 +1,10 @@
 import os
+import json
 import sqlite3
 import time
 from typing import List, Optional
 from pathlib import Path
 
-import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -79,13 +79,17 @@ def _init_db():
         CREATE TABLE IF NOT EXISTS memories (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id TEXT,
+            type TEXT,
             content TEXT,
+            confidence REAL,
             importance INTEGER DEFAULT 1,
             created_at INTEGER,
-            updated_at INTEGER
+            updated_at INTEGER,
+            source TEXT
         )
         """
     )
+    _migrate_memories_table(conn)
     conn.commit()
     conn.close()
 
@@ -146,11 +150,11 @@ def _get_recent_messages(conn: sqlite3.Connection, session_id: str, turns: int) 
 def _get_recent_memories(conn: sqlite3.Connection, user_id: str, k: int) -> List[str]:
     cur = conn.cursor()
     cur.execute(
-        "SELECT content FROM memories WHERE user_id=? ORDER BY updated_at DESC LIMIT ?",
+        "SELECT type, content FROM memories WHERE user_id=? ORDER BY updated_at DESC LIMIT ?",
         (user_id, k),
     )
     rows = cur.fetchall()
-    return [r["content"] for r in rows]
+    return [f'{r["type"]}: {r["content"]}' if r["type"] else r["content"] for r in rows]
 
 
 def _build_messages(user_text: str, context: List[dict], memories: List[str]) -> List[dict]:
@@ -162,7 +166,7 @@ def _build_messages(user_text: str, context: List[dict], memories: List[str]) ->
     return msgs
 
 
-async def _call_deepseek(messages: List[dict]) -> str:
+def _call_deepseek(messages: List[dict]) -> str:
     if not DEEPSEEK_API_KEY:
         raise HTTPException(status_code=500, detail="Missing DEEPSEEK_API_KEY")
 
@@ -178,31 +182,123 @@ async def _call_deepseek(messages: List[dict]) -> str:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DeepSeek error: {e}")
 
+def _migrate_memories_table(conn: sqlite3.Connection):
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(memories)")
+    cols = {row[1] for row in cur.fetchall()}
+    if "type" not in cols:
+        cur.execute("ALTER TABLE memories ADD COLUMN type TEXT")
+    if "confidence" not in cols:
+        cur.execute("ALTER TABLE memories ADD COLUMN confidence REAL")
+    if "source" not in cols:
+        cur.execute("ALTER TABLE memories ADD COLUMN source TEXT")
+    conn.commit()
+
+
+def _extract_memories_prompt(conversation: str) -> List[dict]:
+    system = (
+        "You are a memory extractor. Extract user information suitable for long-term memory and output JSON array. "
+        "Allowed type: preference, fact, habit. Must include confidence (0-1). "
+        "If no memory, return []. Do not record sensitive info "
+        "(ID number, phone, bank card, precise address, medical diagnosis)."
+    )
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": conversation},
+    ]
+    try:
+        raw = _call_deepseek(messages)
+    except HTTPException:
+        return []
+    try:
+        cleaned = raw.strip()
+        if cleaned.startswith("```") and cleaned.endswith("```"):
+            cleaned = cleaned.strip("`").strip()
+        data = json.loads(cleaned)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _memory_is_allowed(item: dict, blacklist: List[str]) -> bool:
+    if not isinstance(item, dict):
+        return False
+    if item.get("type") not in {"preference", "fact", "habit"}:
+        return False
+    confidence = item.get("confidence")
+    if not isinstance(confidence, (int, float)) or confidence < 0.7:
+        return False
+    content = item.get("content")
+    if not isinstance(content, str) or not content.strip():
+        return False
+    lowered = content.lower()
+    return all(word not in lowered for word in blacklist)
+
+
+def _save_memories(conn: sqlite3.Connection, user_id: str, items: List[dict], source: str):
+    blacklist = [
+        "身份证",
+        "手机号",
+        "银行卡",
+        "精确地址",
+        "医疗诊断",
+        "id number",
+        "phone number",
+        "bank card",
+        "precise address",
+        "medical diagnosis",
+    ]
+    now = int(time.time())
+    for item in items:
+        if not _memory_is_allowed(item, blacklist):
+            continue
+        conn.execute(
+            """
+            INSERT INTO memories (user_id, type, content, confidence, created_at, updated_at, source)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user_id,
+                item.get("type"),
+                item.get("content").strip(),
+                float(item.get("confidence")),
+                now,
+                now,
+                source,
+            ),
+        )
+    conn.commit()
+
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest):
+def chat(req: ChatRequest):
     conn = _db()
-    _ensure_user(conn, req.user_id)
-    session_id = _get_or_create_session(conn, req.user_id, req.session_id)
+    try:
+        _ensure_user(conn, req.user_id)
+        session_id = _get_or_create_session(conn, req.user_id, req.session_id)
 
-    _save_message(conn, session_id, "user", req.text)
+        _save_message(conn, session_id, "user", req.text)
 
-    memories = _get_recent_memories(conn, req.user_id, MEMORY_TOP_K)
-    context = _get_recent_messages(conn, session_id, CONTEXT_TURNS)
+        memories = _get_recent_memories(conn, req.user_id, MEMORY_TOP_K)
+        context = _get_recent_messages(conn, session_id, CONTEXT_TURNS)
 
-    messages = _build_messages(req.text, context, memories)
-    reply = await _call_deepseek(messages)
+        messages = _build_messages(req.text, context, memories)
+        reply = _call_deepseek(messages)
 
-    _save_message(conn, session_id, "assistant", reply)
-    conn.close()
-
-    return ChatResponse(reply=reply, session_id=session_id, memory_used=memories)
+        _save_message(conn, session_id, "assistant", reply)
+        conversation = f"User: {req.text}\nAssistant: {reply}"
+        memory_items = _extract_memories_prompt(conversation)
+        _save_memories(conn, req.user_id, memory_items, source="auto")
+        return ChatResponse(reply=reply, session_id=session_id, memory_used=memories)
+    finally:
+        conn.close()
 
 
 class MemoryAddRequest(BaseModel):
     user_id: str
+    type: str
     content: str
-    importance: int = 1
+    confidence: float = 0.9
 
 
 @app.post("/memory/add")
@@ -211,9 +307,58 @@ def memory_add(req: MemoryAddRequest):
     _ensure_user(conn, req.user_id)
     now = int(time.time())
     conn.execute(
-        "INSERT INTO memories (user_id, content, importance, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-        (req.user_id, req.content, req.importance, now, now),
+        """
+        INSERT INTO memories (user_id, type, content, confidence, created_at, updated_at, source)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (req.user_id, req.type, req.content, req.confidence, now, now, "manual"),
     )
     conn.commit()
     conn.close()
     return {"ok": True}
+
+
+@app.get("/memory/list")
+def memory_list(user_id: str):
+    conn = _db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, type, content, confidence, created_at, updated_at, source
+        FROM memories WHERE user_id=? ORDER BY updated_at DESC
+        """,
+        (user_id,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return [
+        {
+            "id": r["id"],
+            "type": r["type"],
+            "content": r["content"],
+            "confidence": r["confidence"],
+            "created_at": r["created_at"],
+            "updated_at": r["updated_at"],
+            "source": r["source"],
+        }
+        for r in rows
+    ]
+
+
+class MemoryDeleteRequest(BaseModel):
+    user_id: str
+    memory_id: int
+
+
+@app.post("/memory/delete")
+def memory_delete(req: MemoryDeleteRequest):
+    conn = _db()
+    cur = conn.cursor()
+    cur.execute(
+        "DELETE FROM memories WHERE id=? AND user_id=?",
+        (req.memory_id, req.user_id),
+    )
+    conn.commit()
+    deleted = cur.rowcount
+    conn.close()
+    return {"ok": True, "deleted": deleted}
